@@ -153,30 +153,53 @@ print_color "green" "SSH has been hardened and restarted on port $SSH_PORT."
 print_color "yellow" "REMEMBER: Password login is now disabled."
 
 
-# --- 5. Install Fail2ban ---
-print_color "green" "[TASK 5/8] Installing Fail2ban for brute-force protection..."
+# --- 5. Harden Kernel Parameters (sysctl) ---
+print_color "green" "[TASK 5/9] Hardening Kernel Parameters..."
+SYSCTL_CONF="/etc/sysctl.d/99-security-hardening.conf"
+
+cat > "$SYSCTL_CONF" << EOF
+# --- IP Spoofing Protection ---
+net.ipv4.conf.default.rp_filter=1
+net.ipv4.conf.all.rp_filter=1
+
+# --- Ignore ICMP Broadcast Requests ---
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+
+# --- Ignore Bogus ICMP Responses ---
+net.ipv4.icmp_ignore_bogus_error_responses = 1
+
+# --- Log Martian Packets (Spoofed/Incorrectly Routed Packets) ---
+net.ipv4.conf.all.log_martians = 1
+EOF
+
+sysctl -p "$SYSCTL_CONF"
+print_color "green" "Kernel parameters have been hardened."
+
+
+# --- 6. Install Fail2ban ---
+print_color "green" "[TASK 6/8] Installing Fail2ban for brute-force protection..."
 apt-get install -y fail2ban
 systemctl enable fail2ban && systemctl start fail2ban
 print_color "green" "Fail2ban has been installed and is now active."
 
 
-# --- 6. Set Up Automatic Security Updates ---
-print_color "green" "[TASK 6/8] Configuring automatic security updates..."
+# --- 7. Set Up Automatic Security Updates ---
+print_color "green" "[TASK 7/8] Configuring automatic security updates..."
 apt-get install -y unattended-upgrades
 dpkg-reconfigure -plow unattended-upgrades
 print_color "green" "Unattended-upgrades configured."
 
 
-# --- 7. Minimize Running Services ---
-print_color "green" "[TASK 7/8] Disabling non-essential services..."
+# --- 8. Minimize Running Services ---
+print_color "green" "[TASK 8/9] Disabling non-essential services..."
 systemctl disable --now bluetooth.service
 systemctl disable --now avahi-daemon.service
 systemctl disable --now avahi-daemon.socket
 print_color "green" "Bluetooth and Avahi services have been disabled."
 
 
-# --- 8. System Cleanup ---
-print_color "green" "[TASK 8/8] Cleaning up unused packages..."
+# --- 9. System Cleanup ---
+print_color "green" "[TASK 9/9] Cleaning up unused packages..."
 apt-get autoremove -y && apt-get clean
 print_color "green" "System cleanup complete."
 
