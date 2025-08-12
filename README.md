@@ -9,6 +9,7 @@ Sequence of events:
 8) Enable Automatic Security updates
 
 Depending on what you are trying to protect, you may also want:
-- apparmor config
+- apparmor or SElinux config
 - systemd service hardening
 - router vlan
+- secure boot
