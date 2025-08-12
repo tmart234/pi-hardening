@@ -7,3 +7,8 @@ Sequence of events:
 6) Fail2Ban install + config for SSH
 7) minimize running services
 8) Enable Automatic Security updates
+
+Depending on what you are trying to protect, you may also want:
+- apparmor config
+- systemd service hardening
+- router vlan
