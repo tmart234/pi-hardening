@@ -1,8 +1,8 @@
 Sequence of events:
 1) Apt update + upgrade
-2) SSH Key Generation (optiomal)
-3) Configure Firewall (UFW)
-4) Harden SSH Configuration
-5) Fail2Ban install + config
+2) SSH Key Generation (optional)
+3) Configure Firewall (UFW; only allow SSH and HTTPS)
+4) Harden SSH Configuration (disable passowrd, etc)
+5) Fail2Ban install + config for SSH
 6) minimize running services
-7) Automatic Security updates
+7) Enable Automatic Security updates
