@@ -45,8 +45,15 @@ Set any of these and pass `-y` to accept the defaults for the rest:
 | `DISABLE_AVAHI` | `no` | Turn off mDNS; `<hostname>.local` will stop working |
 | `AUTO_REBOOT_UPDATES` | `no` | Let unattended-upgrades reboot at 04:00 for kernel updates |
 | `SUDO_REQUIRE_PASSWORD` | `yes`* | Remove Pi OS's passwordless sudo |
+| `LOCK_ROOT_PASSWORD` | `yes`† | Lock root's password if one is set |
+| `BLOCK_USB_STORAGE` | `no` | Block USB sticks and drives |
+| `TMPFS_TMP` | `yes` | Put `/tmp` in RAM (max 25%) if it isn't already |
+| `DISABLE_CLOUD_INIT` | `yes`‡ | Stop cloud-init running on every boot |
 
 \* Only offered if the user has a password set. Otherwise you could lose sudo access.
+† Only offered if the SSH user is in the `sudo` group.
+‡ Only offered once `cloud-init status` reports `done`. Settings it already
+applied (user, Wi-Fi, SSH) stay in place.
 
 ```sh
 sudo SSH_PORT=2222 EXTRA_TCP_PORTS="443" ./harden_pi.sh -y
@@ -66,24 +73,42 @@ sudo SSH_PORT=2222 EXTRA_TCP_PORTS="443" ./harden_pi.sh -y
 4. **fail2ban** uses the systemd journal backend (Bookworm+ has no
    `/var/log/auth.log`) and bans through UFW, with ban times that grow for repeat
    offenders.
-5. **sysctl**: blocks ICMP redirects and source routing, turns on SYN cookies,
-   restricts `kptr`/`dmesg`, hardens BPF, `ptrace` and file protections, and
-   disables suid core dumps.
+5. **Kernel**: sysctl settings block ICMP redirects and source routing, turn on
+   SYN cookies, restrict `kptr`/`dmesg`, harden BPF, `ptrace` and file
+   protections, and disable suid core dumps. Rarely used network protocols
+   (`dccp`, `sctp`, `rds`, `tipc`) and filesystems (`cramfs`, `hfs`, `udf`, etc.)
+   are blocked from loading, and optionally USB storage too.
 6. **unattended-upgrades** also covers the Raspberry Pi repositories. On 32-bit
    Pi OS, every package comes from the `Raspbian` origin, so without this nothing
    gets updated automatically.
 7. **Services**: turns off Bluetooth (`bluetooth`, `hciuart` and the radio itself)
-   and, if you choose, Avahi. Wi-Fi is never touched because it's usually the Zero
-   2 W's only network link.
-8. **sudo**: optionally removes the default `NOPASSWD` rule. Every change is
-   checked with `visudo -c`.
-9. **Cleanup**: `autoremove --purge` and `apt-get clean`.
+   and, if you choose, Avahi. Turns off cloud-init after first-boot setup. Wi-Fi is
+   never touched because it's usually the Zero 2 W's only network link.
+8. **Accounts**: removes console autologin, so plugging in a keyboard and monitor
+   no longer gives a shell. Locks any account with an empty password and,
+   optionally, root's password. Optionally removes the default sudo `NOPASSWD`
+   rule; every sudoers change is checked with `visudo -c`.
+9. **Mounts and logs**: `/dev/shm` gets `nosuid,nodev,noexec`, and `/tmp` moves to
+   RAM with `nosuid,nodev`, which also saves SD wear. `/etc/fstab` is checked with
+   `findmnt --verify` and restored if the check fails, since a broken fstab would
+   leave a headless Pi stuck at boot. The journal is kept across reboots and
+   capped at 64 MB.
+10. **Cleanup**: `autoremove --purge` and `apt-get clean`.
+
+At the end the script lists every service listening on the network, so you can
+spot anything you don't need.
 
 Output is logged to `/var/log/pi-hardening.log`. Every file the script changes is
 backed up as `<file>.bak-<timestamp>`. You can run the script again safely, for
 example to change the SSH port.
 
-## Changes from v4
+## Changes in v6
+
+- Added console autologin removal, empty-password and root account locking,
+  kernel module blocking, `/tmp` and `/dev/shm` mount options, a persistent
+  capped journal, turning off cloud-init, and the listening-services report.
+
+## Changes from v4 to v5
 
 - SSH settings used to be appended to the end of `sshd_config`. sshd uses the
   *first* value it reads, and drop-ins like Imager/cloud-init's
@@ -108,6 +133,8 @@ example to change the SSH port.
   holding the card can read and change it. The Zero 2 W doesn't support Raspberry Pi
   secure boot (that's Pi 4/5/CM4 only).
 - AppArmor (needs `apparmor=1 security=apparmor` in `cmdline.txt`)
+- Restricting outbound traffic (`ufw default deny outgoing` plus DNS/NTP/HTTP(S))
+- Run [Lynis](https://cisofy.com/lynis/) (`sudo apt install lynis && sudo lynis audit system`) to find what's left
 - systemd service sandboxing (`systemd-analyze security`)
 - Putting the Pi on its own VLAN or IoT network on your router
 - If you use SSH from a phone or tablet, consider a hardware/FIDO2 key (`ed25519-sk`)

@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================================
-# Raspberry Pi Zero 2 W - Security Hardening Script (v5)
+# Raspberry Pi Zero 2 W - Security Hardening Script (v6)
 #
 # Targets Raspberry Pi OS Lite (Bookworm / Trixie, 32- or 64-bit). Also works on
 # older releases and other Pi models, but defaults are tuned for the Zero 2 W:
@@ -23,13 +23,15 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="5"
+SCRIPT_VERSION="6"
 LOG_FILE="/var/log/pi-hardening.log"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 SSHD_DROPIN="/etc/ssh/sshd_config.d/00-pi-hardening.conf"
 SYSCTL_CONF="/etc/sysctl.d/99-pi-hardening.conf"
 F2B_JAIL="/etc/fail2ban/jail.d/zz-pi-hardening.local"
 UU_CONF="/etc/apt/apt.conf.d/52pi-hardening-unattended-upgrades"
+MODPROBE_CONF="/etc/modprobe.d/pi-hardening.conf"
+JOURNALD_CONF="/etc/systemd/journald.conf.d/pi-hardening.conf"
 
 # --- Tunables (environment overrides; prompted for when unset) -------------------
 ASSUME_YES="${ASSUME_YES:-no}"
@@ -41,6 +43,10 @@ DISABLE_BLUETOOTH="${DISABLE_BLUETOOTH:-}"
 DISABLE_AVAHI="${DISABLE_AVAHI:-}"
 SUDO_REQUIRE_PASSWORD="${SUDO_REQUIRE_PASSWORD:-}"
 AUTO_REBOOT_UPDATES="${AUTO_REBOOT_UPDATES:-}"
+BLOCK_USB_STORAGE="${BLOCK_USB_STORAGE:-}"
+TMPFS_TMP="${TMPFS_TMP:-}"
+DISABLE_CLOUD_INIT="${DISABLE_CLOUD_INIT:-}"
+LOCK_ROOT_PASSWORD="${LOCK_ROOT_PASSWORD:-}"
 
 # --- Helpers ---------------------------------------------------------------------
 print_color() {
@@ -179,6 +185,36 @@ ask_yn INSTALL_FAIL2BAN "Install fail2ban (~40 MB RAM; UFW rate limiting is appl
 ask_yn DISABLE_BLUETOOTH "Disable Bluetooth (firmware-level, frees the UART)?" y
 ask_yn DISABLE_AVAHI "Disable Avahi/mDNS? (you will no longer reach the Pi as <hostname>.local)" n
 ask_yn AUTO_REBOOT_UPDATES "Allow unattended-upgrades to reboot at 04:00 when a kernel update needs it?" n
+ask_yn BLOCK_USB_STORAGE "Block USB mass storage? (USB sticks/drives will stop working)" n
+
+if [ "$(findmnt -n -o FSTYPE /tmp 2>/dev/null)" = tmpfs ] || awk '$2=="/tmp"{f=1} END{exit !f}' /etc/fstab; then
+    TMPFS_TMP=already
+else
+    ask_yn TMPFS_TMP "Put /tmp in RAM (tmpfs, max 25% of RAM; less SD wear, cleared on reboot)?" y
+fi
+
+if command -v cloud-init >/dev/null && [ ! -e /etc/cloud/cloud-init.disabled ]; then
+    CI_STATUS="$(cloud-init status 2>/dev/null || true)"   # non-zero exit for "degraded done"
+    if grep -q 'status: done' <<<"$CI_STATUS"; then
+        ask_yn DISABLE_CLOUD_INIT "cloud-init finished first-boot setup. Disable it so it stops running on every boot?" y
+    else
+        info "cloud-init has not reported 'done'; leaving it enabled."
+        DISABLE_CLOUD_INIT=no
+    fi
+else
+    DISABLE_CLOUD_INIT=n/a
+fi
+
+if passwd -S root 2>/dev/null | awk '{exit !($2=="P")}'; then
+    if grep -qw sudo <<<"$(id -nG "$SSH_USER")"; then
+        ask_yn LOCK_ROOT_PASSWORD "root has a password set. Lock it (use sudo instead)?" y
+    else
+        info "root has a password, but '$SSH_USER' is not in the sudo group, so root is left unlocked."
+        LOCK_ROOT_PASSWORD=no
+    fi
+else
+    LOCK_ROOT_PASSWORD=n/a
+fi
 
 SUDO_NOPASSWD_FILES="$(grep -lsE "^[[:space:]]*${SSH_USER}[[:space:]].*NOPASSWD" /etc/sudoers.d/* || true)"
 if [ -n "$SUDO_NOPASSWD_FILES" ]; then
@@ -193,7 +229,7 @@ else
     SUDO_REQUIRE_PASSWORD=no
 fi
 
-TOTAL_TASKS=9
+TOTAL_TASKS=10
 ok "All questions answered. The rest runs unattended."
 
 # =================================================================================
@@ -345,7 +381,7 @@ fi
 # =================================================================================
 # 5. Kernel parameters
 # =================================================================================
-task 5 "Hardening kernel parameters..."
+task 5 "Hardening kernel parameters and modules..."
 # A leading '-' makes systemd-sysctl (used at boot) ignore keys this kernel lacks;
 # 'sysctl -e' does the same for the immediate apply below.
 cat > "$SYSCTL_CONF" <<'EOF'
@@ -387,6 +423,30 @@ fs.suid_dumpable = 0
 EOF
 sysctl -e -q -p "$SYSCTL_CONF" || info "Some sysctl keys could not be applied on this kernel (see above)."
 ok "Kernel parameters applied."
+
+# Rarely used network protocols and filesystems with a history of kernel bugs.
+# "install <mod> /bin/false" also stops them being auto-loaded on demand.
+{
+    echo "# Managed by pi-hardening v$SCRIPT_VERSION"
+    for m in dccp sctp rds tipc cramfs freevxfs hfs hfsplus jffs2 udf; do
+        echo "install $m /bin/false"
+        echo "blacklist $m"
+    done
+    if [ "$BLOCK_USB_STORAGE" = yes ]; then
+        echo "# USB mass storage (the OTG port is the main physical attack surface)"
+        echo "install usb-storage /bin/false"
+        echo "install uas /bin/false"
+        echo "blacklist usb-storage"
+        echo "blacklist uas"
+    fi
+} > "$MODPROBE_CONF"
+LOADED_MODULES="$(lsmod 2>/dev/null || true)"
+for m in dccp sctp rds tipc cramfs freevxfs hfs hfsplus jffs2 udf; do
+    if grep -q "^$m " <<<"$LOADED_MODULES"; then
+        info "Module $m is currently loaded; it will stay loaded until reboot."
+    fi
+done
+ok "Unused kernel modules blocked ($MODPROBE_CONF)."
 
 # =================================================================================
 # 6. Automatic security updates
@@ -447,13 +507,40 @@ if [ "$DISABLE_AVAHI" = yes ]; then
     disable_unit avahi-daemon.socket
     disable_unit avahi-daemon.service
 fi
+if [ "$DISABLE_CLOUD_INIT" = yes ]; then
+    # Settings it already applied (user, Wi-Fi via netplan/NetworkManager, SSH) stay in place.
+    touch /etc/cloud/cloud-init.disabled
+    echo "  disabled cloud-init (re-enable: sudo rm /etc/cloud/cloud-init.disabled)"
+fi
 # Never disable Wi-Fi here: on a Zero 2 W it is usually the only network link.
 ok "Services minimized."
 
 # =================================================================================
 # 8. sudo
 # =================================================================================
-task 8 "Reviewing sudo configuration..."
+task 8 "Hardening accounts, console and sudo..."
+# Console autologin (raspi-config "Console Autologin") gives a root-capable shell
+# to anyone who plugs in a keyboard and monitor.
+AUTOLOGIN_FILES="$(grep -lsE -- '--autologin|-a[[:space:]]' \
+    /etc/systemd/system/getty@*.service.d/*.conf \
+    /etc/systemd/system/serial-getty@*.service.d/*.conf || true)"
+for f in $AUTOLOGIN_FILES; do
+    mv "$f" "/root/$(basename "$(dirname "$f")")-$(basename "$f").bak-$STAMP"
+    echo "  removed console autologin: $f (takes effect after reboot)"
+done
+[ -n "$AUTOLOGIN_FILES" ] && systemctl daemon-reload
+
+EMPTY_PW_USERS="$(awk -F: '$2=="" {print $1}' /etc/shadow)"
+for u in $EMPTY_PW_USERS; do
+    passwd -l "$u" >/dev/null
+    echo "  locked account with EMPTY password: $u"
+done
+
+if [ "$LOCK_ROOT_PASSWORD" = yes ]; then
+    passwd -l root >/dev/null
+    echo "  locked root password (use sudo)"
+fi
+
 if [ "$SUDO_REQUIRE_PASSWORD" = yes ]; then
     for f in $SUDO_NOPASSWD_FILES; do
         backup "$f"
@@ -466,15 +553,59 @@ if [ "$SUDO_REQUIRE_PASSWORD" = yes ]; then
         fi
         echo "  removed NOPASSWD for $SSH_USER in $f"
     done
-    ok "sudo now asks for $SSH_USER's password."
-else
-    info "No change."
+    echo "  sudo now asks for $SSH_USER's password"
 fi
+ok "Accounts reviewed."
 
 # =================================================================================
-# 9. Cleanup
+# 9. Filesystem mounts and logging
 # =================================================================================
-task 9 "Cleaning up..."
+task 9 "Hardening temporary filesystems and logging..."
+FSTAB_CHANGED=no
+fstab_add() {
+    # fstab_add <mountpoint> <line>; skipped if fstab already has the mountpoint
+    if ! awk -v m="$1" '$2==m {f=1} END {exit !f}' /etc/fstab; then
+        [ "$FSTAB_CHANGED" = yes ] || backup /etc/fstab
+        FSTAB_CHANGED=yes
+        printf '# Added by pi-hardening\n%s\n' "$2" >> /etc/fstab
+        echo "  fstab: $2"
+    fi
+}
+fstab_add /dev/shm "tmpfs /dev/shm tmpfs defaults,nosuid,nodev,noexec 0 0"
+[ "$TMPFS_TMP" = yes ] && fstab_add /tmp "tmpfs /tmp tmpfs defaults,nosuid,nodev,mode=1777,size=25% 0 0"
+if [ "$FSTAB_CHANGED" = yes ]; then
+    # A broken fstab drops a headless Pi into emergency mode, so verify first.
+    if ! findmnt --verify --tab-file /etc/fstab >/dev/null 2>&1; then
+        findmnt --verify --tab-file /etc/fstab || true
+        cp -a "/etc/fstab.bak-$STAMP" /etc/fstab
+        info "fstab verification failed; original restored and mount changes skipped."
+    else
+        systemctl daemon-reload
+    fi
+fi
+mount -o remount,nosuid,nodev,noexec /dev/shm 2>/dev/null || true
+[ "$TMPFS_TMP" = yes ] && echo "  /tmp moves to RAM after reboot"
+
+# Keep logs across reboots (evidence of an intrusion should survive a reboot),
+# but cap their size on the SD card.
+mkdir -p "$(dirname "$JOURNALD_CONF")" /var/log/journal
+cat > "$JOURNALD_CONF" <<'EOF'
+# Managed by pi-hardening
+[Journal]
+Storage=persistent
+SystemMaxUse=64M
+SystemMaxFileSize=8M
+RuntimeMaxUse=16M
+EOF
+systemd-tmpfiles --create --prefix /var/log/journal >/dev/null 2>&1 || true
+systemctl restart systemd-journald
+journalctl --flush >/dev/null 2>&1 || true
+ok "Mounts and logging configured (journal: persistent, max 64 MB)."
+
+# =================================================================================
+# 10. Cleanup
+# =================================================================================
+task 10 "Cleaning up..."
 apt-get "${APT_OPTS[@]}" autoremove --purge
 apt-get clean
 ok "Cleanup complete."
@@ -492,8 +623,15 @@ echo "  - fail2ban: $INSTALL_FAIL2BAN"
 echo "  - Kernel/network sysctl hardening: $SYSCTL_CONF"
 echo "  - Automatic updates incl. Raspberry Pi repos (auto-reboot: $AUTO_REBOOT_UPDATES)."
 echo "  - Bluetooth disabled: $DISABLE_BLUETOOTH   Avahi disabled: $DISABLE_AVAHI"
-echo "  - sudo requires password: $SUDO_REQUIRE_PASSWORD"
+echo "  - Unused kernel modules blocked (USB storage too: $BLOCK_USB_STORAGE)."
+echo "  - Console autologin removed: ${AUTOLOGIN_FILES:+yes}${AUTOLOGIN_FILES:-none found}   Empty-password accounts locked: ${EMPTY_PW_USERS:-none}"
+echo "  - root password locked: $LOCK_ROOT_PASSWORD   sudo requires password: $SUDO_REQUIRE_PASSWORD"
+echo "  - /dev/shm noexec; /tmp in RAM: $TMPFS_TMP; persistent journal capped at 64 MB."
+echo "  - cloud-init disabled: $DISABLE_CLOUD_INIT"
 echo "  - Log: $LOG_FILE   Backups: *.bak-$STAMP"
+print_color yellow "Services listening on the network right now (anything unexpected? remove it):"
+ss -H -tulpn 2>/dev/null | awk '$5 !~ /^(127\.|\[::1\]|\[::ffff:127\.)/ {printf "    %-4s %-28s %s\n", $1, $5, $7}' || true
+echo "    (UFW blocks inbound to anything not listed in the firewall rules above.)"
 print_color red "BEFORE closing this session, open a NEW terminal and test:"
 echo "    ssh -p $SSH_PORT $SSH_USER@<pi-address>"
 print_color red "A REBOOT is required for all changes (firmware/kernel) to take effect."
